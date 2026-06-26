@@ -139,20 +139,6 @@ checkRatesFreshness();
 
 interface BillItem { description: string; cptCode: string; quantity: number; chargedAmount: number; }
 
-// Zod schema for validating bill items
-const CPT_CODE_PATTERN = /^(?:\d{5}|J\d{4})$/;
-
-const BillItemSchema = z.object({
-  description: z.string().min(1, "description is required"),
-  cptCode: z.string().regex(CPT_CODE_PATTERN, "cptCode must be a valid CPT code (5 digits or J followed by 4 digits)"),
-  quantity: z.number().positive("quantity must be positive"),
-  chargedAmount: z.number().nonnegative("chargedAmount must be non-negative"),
-});
-
-const BillAuditRequestSchema = z.object({
-  lineItems: z.array(BillItemSchema).min(1, "lineItems must contain at least one item"),
-});
-
 function auditBill(lineItems: BillItem[]) {
   const results: any[] = [];
   let totalCharged = 0, totalCorrect = 0, errorCount = 0;
@@ -242,19 +228,20 @@ applyX402Middleware(app, {
 
 app.post("/bill/audit", (req, res) => {
   try {
-    const validatedData = BillAuditRequestSchema.parse(req.body);
-    const sanitizedLineItems = validatedData.lineItems.map(item => ({
+    const validatedData = validateBillAuditRequest(req.body);
+    const sanitizedLineItems = validatedData.lineItems.map((item) => ({
       ...item,
       description: sanitizeUserString(item.description),
     }));
     res.json(auditBill(sanitizedLineItems));
   } catch (error) {
     if (error instanceof BillAuditValidationError) {
+      const validationError = error as BillAuditValidationError;
       res.status(400).json({
         ok: false,
-        reason: error.code,
-        message: error.message,
-        issues: error.issues,
+        reason: validationError.code,
+        message: validationError.message,
+        issues: validationError.issues,
       });
     } else {
       res.status(400).json({ ok: false, reason: "INVALID_REQUEST_BODY" });

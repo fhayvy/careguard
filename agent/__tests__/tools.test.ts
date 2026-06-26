@@ -2,6 +2,7 @@
 const { mockMppFetch, onProgressHolder, MOCK_HINT } = vi.hoisted(() => {
   process.env.AGENT_SECRET_KEY = "SBWWZYCAFDDJXNRRMKSFNRB6OTVZHTCMPUCVZ4FBZLSPHFKHYLPRTJCD";
   process.env.MOCK_NETWORK = "1";
+  process.env.SPENDING_TIMEZONE = "UTC";
   const onProgressHolder: { fn?: (event: any) => void } = {};
   return {
     mockMppFetch: vi.fn(),
@@ -136,6 +137,51 @@ describe("Spending Policy", () => {
   it("should allow valid amounts within policy", () => {
     const policy = checkSpendingPolicy(50, "medications");
     expect(policy.allowed).toBe(true);
+  });
+
+  it("counts transactions at midnight and 1ms past midnight in the current day", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T12:00:00.000Z"));
+
+    const tracker = loadSpending("rosa");
+    tracker.transactions = [
+      {
+        id: "tx-midnight",
+        timestamp: "2026-04-10T00:00:00.000Z",
+        type: "payment",
+        description: "Midnight medication",
+        amount: 40,
+        recipient: "pharmacy-1",
+        status: "completed",
+        category: "medications",
+      },
+      {
+        id: "tx-midnight-plus-1ms",
+        timestamp: "2026-04-10T00:00:00.001Z",
+        type: "payment",
+        description: "Midnight medication +1ms",
+        amount: 40,
+        recipient: "pharmacy-1",
+        status: "completed",
+        category: "medications",
+      },
+      {
+        id: "tx-previous-day",
+        timestamp: "2026-04-09T23:59:59.999Z",
+        type: "payment",
+        description: "Previous day medication",
+        amount: 10,
+        recipient: "pharmacy-1",
+        status: "completed",
+        category: "medications",
+      },
+    ] as any;
+
+    const policy = checkSpendingPolicy(30, "medications");
+    expect(policy.allowed).toBe(false);
+    expect(policy.reason).toContain("Already spent today: $80.00");
+
+    vi.useRealTimers();
   });
 });
 

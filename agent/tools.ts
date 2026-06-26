@@ -47,8 +47,8 @@ import {
   type SpendingPolicy,
   type Transaction,
 } from '../shared/types.ts';
-import { SPENDING_TIMEZONE, getLocalDateStr } from './tz.ts';
-export { SPENDING_TIMEZONE, getLocalDateStr };
+import { SPENDING_TIMEZONE, getLocalDateStr, getLocalDayBounds } from './tz.ts';
+export { SPENDING_TIMEZONE, getLocalDateStr, getLocalDayBounds };
 import { appendAuditEntry } from '../shared/audit-log.ts';
 import { notify } from '../shared/notifications.ts';
 import {
@@ -1035,12 +1035,20 @@ export function checkSpendingPolicy(
     };
   }
 
-  const today = getLocalDateStr(SPENDING_TIMEZONE);
+  const { dayStart, dayEnd } = getLocalDayBounds(SPENDING_TIMEZONE);
+  const dayStartMs = dayStart.getTime();
+  const dayEndMs = dayEnd.getTime();
   const totalToday = spendingTracker.transactions
     .filter(
-      (t) =>
-        getLocalDateStr(SPENDING_TIMEZONE, new Date(t.timestamp)) === today &&
-        t.category === category,
+      (t) => {
+        const txTimestamp = new Date(t.timestamp).getTime();
+        return (
+          Number.isFinite(txTimestamp) &&
+          txTimestamp >= dayStartMs &&
+          txTimestamp < dayEndMs &&
+          t.category === category
+        );
+      },
     )
     .reduce((sum, t) => sum + t.amount, 0);
 

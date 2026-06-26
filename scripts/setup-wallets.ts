@@ -6,10 +6,12 @@
  */
 
 import { Keypair, Networks, TransactionBuilder, Operation, Asset, Horizon } from "@stellar/stellar-sdk";
-import { createHash, randomBytes } from "crypto";
+import { createHash, createHmac } from "crypto";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import { pathToFileURL } from "url";
+import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from "@scure/bip39";
+import { wordlist as englishWordlist } from "@scure/bip39/wordlists/english";
 import { logger } from "../shared/logger.ts";
 
 const HORIZON_URL = "https://horizon-testnet.stellar.org";
@@ -24,6 +26,9 @@ export const WALLET_NAMES = [
   "PHARMACY_3",
   "BILL_PROVIDER",
 ] as const;
+const HARDENED_OFFSET = 0x80000000;
+const STELLAR_DERIVATION_PATH = [44, 148] as const;
+const GENERATED_MNEMONIC_STRENGTH = 256;
 
 export interface WalletInfo {
   name: string;
@@ -31,7 +36,15 @@ export interface WalletInfo {
   secretKey: string;
 }
 
-export function deriveWalletsFromSeed(seedMaterial: string): WalletInfo[] {
+function normalizeSeedMaterial(seedMaterial: string) {
+  return seedMaterial.trim().normalize("NFKD").split(/\s+/).join(" ");
+}
+
+export function isMnemonicSeed(seedMaterial: string) {
+  return validateMnemonic(normalizeSeedMaterial(seedMaterial), englishWordlist);
+}
+
+function deriveLegacyWalletsFromSeed(seedMaterial: string): WalletInfo[] {
   return WALLET_NAMES.map((name, index) => {
     const rawSeed = createHash("sha256")
       .update(seedMaterial)
@@ -47,6 +60,62 @@ export function deriveWalletsFromSeed(seedMaterial: string): WalletInfo[] {
       secretKey: keypair.secret(),
     };
   });
+}
+
+function hardenedIndex(index: number) {
+  return index + HARDENED_OFFSET;
+}
+
+function serializeIndex(index: number) {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt32BE(index);
+  return buffer;
+}
+
+function deriveSlip10Seed(masterSeed: Uint8Array, index: number) {
+  let hmac = createHmac("sha512", "ed25519 seed");
+  hmac.update(masterSeed);
+  let result = hmac.digest();
+  let privateKey = result.subarray(0, 32);
+  let chainCode = result.subarray(32);
+
+  for (const segment of [...STELLAR_DERIVATION_PATH, index]) {
+    const data = Buffer.concat([
+      Buffer.from([0]),
+      privateKey,
+      serializeIndex(hardenedIndex(segment)),
+    ]);
+    hmac = createHmac("sha512", chainCode);
+    hmac.update(data);
+    result = hmac.digest();
+    privateKey = result.subarray(0, 32);
+    chainCode = result.subarray(32);
+  }
+
+  return privateKey;
+}
+
+function deriveWalletsFromMnemonic(mnemonic: string): WalletInfo[] {
+  const normalizedMnemonic = normalizeSeedMaterial(mnemonic);
+  const masterSeed = mnemonicToSeedSync(normalizedMnemonic);
+
+  return WALLET_NAMES.map((name, index) => {
+    const rawSeed = deriveSlip10Seed(masterSeed, index);
+    const keypair = Keypair.fromRawEd25519Seed(rawSeed);
+    return {
+      name,
+      publicKey: keypair.publicKey(),
+      secretKey: keypair.secret(),
+    };
+  });
+}
+
+export function deriveWalletsFromSeed(seedMaterial: string): WalletInfo[] {
+  if (isMnemonicSeed(seedMaterial)) {
+    return deriveWalletsFromMnemonic(seedMaterial);
+  }
+
+  return deriveLegacyWalletsFromSeed(seedMaterial);
 }
 
 async function confirmDevSeedGeneration(): Promise<boolean> {
@@ -88,7 +157,7 @@ export async function resolveSetupSeed(options: {
     );
   }
 
-  const seed = randomBytes(32).toString("hex");
+  const seed = generateMnemonic(englishWordlist, GENERATED_MNEMONIC_STRENGTH);
   writeFileSync(seedPath, `${seed}\n`, { mode: 0o600 });
   return { seed, source: "generated", path: seedPath };
 }
@@ -146,6 +215,12 @@ async function main() {
     logger.info({ path: seed.path }, "generated setup seed");
   } else {
     logger.info({ source: seed.source }, "using setup seed");
+  }
+
+  if (!isMnemonicSeed(seed.seed)) {
+    logger.warn(
+      "using legacy non-mnemonic setup seed; recovery via BIP-39 mnemonic is unavailable until you replace .dev-seed or pass --seed",
+    );
   }
 
   const wallets = deriveWalletsFromSeed(seed.seed);

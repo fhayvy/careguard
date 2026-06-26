@@ -14,7 +14,6 @@ if (!process.stdout.isTTY) {
 
 import "dotenv/config";
 import express from "express";
-import { z } from "zod";
 import { Mppx, Store } from "mppx/server";
 import { stellar } from "@stellar/mpp/charge/server";
 import { USDC_SAC_TESTNET } from "@stellar/mpp";
@@ -24,6 +23,10 @@ import { logger } from "../../shared/logger.ts";
 import { requestContextMiddleware } from "../../shared/request-context.ts";
 import { requestLoggerMiddleware } from "../../shared/request-logger.ts";
 import { sanitizeUserString } from "../../shared/sanitize.ts";
+import {
+  MedicationOrderSchema,
+  type MedicationOrderInput,
+} from "./validation.ts";
 
 const PORT = parseInt(process.env.PHARMACY_PAYMENT_PORT || "3005");
 const RECIPIENT = process.env.PHARMACY_1_PUBLIC_KEY;
@@ -116,44 +119,20 @@ const mppx = Mppx.create({
   ],
 });
 
-// Zod schema for amount validation
-const OrderAmountSchema = z.union([
-  z.number().min(0.01, "amount must be at least $0.01").max(10000, "amount must not exceed $10,000"),
-  z.string().transform((val, ctx) => {
-    const parsed = parseFloat(val);
-    if (!Number.isFinite(parsed)) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "amount must be a valid number" });
-      return z.NEVER;
-    }
-    if (parsed < 0.01) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "amount must be at least $0.01" });
-      return z.NEVER;
-    }
-    if (parsed > 10000) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "amount must not exceed $10,000" });
-      return z.NEVER;
-    }
-    return parsed;
-  }),
-]);
-
 // MPP-protected medication order endpoint
 app.post("/pharmacy/order", async (req, res) => {
-  const { drug, pharmacy, amount } = req.body;
-
-  if (!drug || !pharmacy || !amount) {
-    res.status(400).json({ error: "Missing required fields: drug, pharmacy, amount" });
+  const parsedOrder = MedicationOrderSchema.safeParse(req.body);
+  if (!parsedOrder.success) {
+    res.status(400).json({
+      error: "Invalid order request",
+      details: parsedOrder.error.issues.map((issue) => issue.message),
+    });
     return;
   }
 
-  const parsedAmount = OrderAmountSchema.safeParse(amount);
-  if (!parsedAmount.success) {
-    res.status(400).json({ error: "Invalid amount", details: parsedAmount.error.issues.map(i => i.message) });
-    return;
-  }
-
-  const safeDrug = sanitizeUserString(drug);
-  const safePharmacy = sanitizeUserString(pharmacy);
+  const order = parsedOrder.data as MedicationOrderInput;
+  const safeDrug = sanitizeUserString(order.drug);
+  const safePharmacy = sanitizeUserString(order.pharmacy);
 
   // Convert Express request to Web Request for mppx
   const headers = new Headers();
@@ -173,7 +152,7 @@ app.post("/pharmacy/order", async (req, res) => {
 
   // Run MPP charge flow
   const result = await mppx.charge({
-    amount: parsedAmount.data.toFixed(2),
+    amount: order.amount.toFixed(2),
     description: `Medication: ${safeDrug} from ${safePharmacy}`,
   })(webReq);
 
@@ -191,7 +170,7 @@ app.post("/pharmacy/order", async (req, res) => {
     id: `order-${Date.now()}`,
     drug: safeDrug,
     pharmacy: safePharmacy,
-    amount: parsedAmount.data,
+    amount: order.amount,
     status: "confirmed",
     timestamp: new Date().toISOString(),
     network: NETWORK,
@@ -204,7 +183,7 @@ app.post("/pharmacy/order", async (req, res) => {
     Response.json({
       success: true,
       order,
-      message: `Payment of $${parsedAmount.data} USDC settled on Stellar. ${safeDrug} order from ${safePharmacy} confirmed.`,
+      message: `Payment of $${order.amount} USDC settled on Stellar. ${safeDrug} order from ${safePharmacy} confirmed.`,
     })
   );
 

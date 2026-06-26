@@ -8,6 +8,10 @@ dist/
 data/audit.log.jsonl
 data/spending.json
 data/orders.json
+data/pharmacy-pricing.sqlite
+data/pharmacy-pricing.sqlite-*
+data/pharmacy-pricing.sqlite-shm
+data/pharmacy-pricing.sqlite-wal
 data/adherence.jsonl
 data/recipients/*/*.json
 !data/recipients/*/

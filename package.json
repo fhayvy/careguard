@@ -16,6 +16,7 @@
     "typecheck": "tsc -b",
     "build": "tsc --noEmit",
     "lint": "tsc --noEmit",
+    "gen-openapi": "node --import tsx scripts/gen-openapi.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "load": "k6 run load/agent-run.js",
