@@ -43,6 +43,7 @@ import {
   metricsHandler,
   agentRunsTotal,
   agentToolCallsTotal,
+  pharmacyUnknownDrugTotal,
 } from "./shared/metrics.ts";
 
 // Shared agent pause state + wallet low-balance scheduler
@@ -538,6 +539,11 @@ app.get("/pharmacy/compare", (req, res) => {
 
   try {
     const prices = pharmacyStore.getPrices(drug);
+    if (prices.length === 0) {
+      pharmacyUnknownDrugTotal.inc({ drug });
+      res.status(404).json({ ok: false, reason: "NO_PRICES_FOUND" });
+      return;
+    }
     res.json(
       buildCompareResponse({
         drug,
@@ -549,11 +555,8 @@ app.get("/pharmacy/compare", (req, res) => {
       }),
     );
   } catch (error) {
-    res.status(404).json({
-      error: error instanceof Error ? error.message : `Drug "${drug}" not found`,
-      provider: "sqlite",
-      drugCount: pharmacyStore.getDrugCount(),
-    });
+    pharmacyUnknownDrugTotal.inc({ drug });
+    res.status(404).json({ ok: false, reason: "NO_PRICES_FOUND" });
   }
 });
 
