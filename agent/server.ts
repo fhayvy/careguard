@@ -9,6 +9,8 @@
  */
 
 import "dotenv/config";
+import { createHash } from "crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "fs";
 import { existsSync, mkdirSync } from "fs";
 import express, { type Express } from "express";
 import OpenAI from "openai";
@@ -39,6 +41,7 @@ import {
   confirmAdherenceReminder,
   setCurrentRecipient,
   SpendingPolicySchema,
+  getDataDir,
   payForMedication,
   payBill,
 } from "./tools.ts";
@@ -182,7 +185,33 @@ app.get("/metrics", metricsHandler());
 const MAX_TOOL_CALLS_PER_RUN = parseInt(process.env.MAX_TOOL_CALLS_PER_RUN || "30", 10);
 let toolCallCapHitsTotal = 0;
 
-let agentPaused = false;
+// ── Persisted agent-pause state (Issue #17) ──────────────────────────────────
+// Persists to data/agent-state.json so a paused agent stays paused across
+// restarts.  Writes are atomic (tmp + rename) to avoid corrupt reads.
+const AGENT_STATE_FILE = () => `${getDataDir()}/agent-state.json`;
+
+function loadAgentState(): { paused: boolean } {
+  try {
+    const file = AGENT_STATE_FILE();
+    if (!existsSync(file)) return { paused: false };
+    return JSON.parse(readFileSync(file, "utf-8"));
+  } catch {
+    return { paused: false };
+  }
+}
+
+function saveAgentState(state: { paused: boolean }): void {
+  try {
+    const file = AGENT_STATE_FILE();
+    const tmp = `${file}.tmp-${Date.now()}`;
+    writeFileSync(tmp, JSON.stringify(state), "utf-8");
+    renameSync(tmp, file);
+  } catch (err) {
+    logger.warn({ err }, "[agent-state] Failed to persist agent state");
+  }
+}
+
+let agentPaused = loadAgentState().paused;
 
 // In-memory cache for wallet balances (5s TTL)
 interface WalletCacheEntry {
@@ -292,6 +321,7 @@ app.get("/", (_req, res) => {
 app.get("/agent/status", (_req, res) => { res.json({ paused: agentPaused }); });
 app.post("/agent/pause", (_req, res) => {
   agentPaused = true;
+  saveAgentState({ paused: true });
   logger.info("agent paused by caregiver");
   notify({ level: "warning", title: "Agent Paused", description: "CareGuard agent has been paused by the caregiver. No payments or actions will be processed until resumed." });
   broadcastSSE("status", { paused: true });
@@ -299,6 +329,7 @@ app.post("/agent/pause", (_req, res) => {
 });
 app.post("/agent/resume", (_req, res) => {
   agentPaused = false;
+  saveAgentState({ paused: false });
   logger.info("agent resumed by caregiver");
   notify({ level: "info", title: "Agent Resumed", description: "CareGuard agent has been resumed and is now processing actions." });
   broadcastSSE("status", { paused: false });

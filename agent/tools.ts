@@ -81,6 +81,7 @@ import {
   agentTransactionsTotal,
   x402TxExtractionFailedTotal,
   stellarFeeBumpsTotal,
+  stellarTxBadSeqRetriesTotal,
 } from '../shared/metrics.ts';
 import { getTargetFee } from '../shared/stellar-fee.ts';
 import {
@@ -214,6 +215,32 @@ async function submitTransactionWithRetry(
       lastError = err;
       if (err?.response?.status) throw err;
       const msg = err?.message ?? "";
+
+      // tx_bad_seq: sequence number mismatch — reload account and rebuild with 1 s backoff
+      if (msg.includes("tx_bad_seq") && rebuildTx) {
+        for (let seqRetry = 0; seqRetry < 3; seqRetry++) {
+          await new Promise((r) => setTimeout(r, 1000));
+          try {
+            tx = await rebuildTx();
+          } catch {
+            break;
+          }
+          stellarTxBadSeqRetriesTotal.inc();
+          logger.warn(
+            { seq: tx?.sequence, attempt: seqRetry + 1, reason: "tx_bad_seq" },
+            "[Stellar] tx_bad_seq — reloaded account, retrying",
+          );
+          try {
+            const result = await server.submitTransaction(tx, { timeout: timeoutMs } as any);
+            return result;
+          } catch (retryErr: any) {
+            lastError = retryErr;
+            if (!retryErr?.message?.includes("tx_bad_seq")) throw retryErr;
+          }
+        }
+        throw lastError;
+      }
+
       // tx_too_late: timebounds expired — retry once with fresh timebounds if rebuild fn provided
       if (msg.includes("tx_too_late") && rebuildTx && attempt < maxRetries) {
         logger.warn({ attempt: attempt + 1 }, "[Stellar] tx_too_late, rebuilding with fresh timebounds");
@@ -261,7 +288,19 @@ async function submitTransactionWithFeeBump(
       const builtTx = tx.setTimeout(30).build();
       builtTx.sign(signer);
 
-      const result = await submitTransactionWithRetry(server, builtTx);
+      const result = await submitTransactionWithRetry(server, builtTx, 2, 35000, async () => {
+        const freshAccount = await server.loadAccount(signer.publicKey());
+        const newTx = new TransactionBuilder(freshAccount, {
+          fee: currentFee,
+          networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+        });
+        for (const op of operations) {
+          newTx.addOperation(op);
+        }
+        const rebuilt = newTx.setTimeout(30).build();
+        rebuilt.sign(signer);
+        return rebuilt;
+      });
       return { hash: result.hash, fee: currentFee };
     } catch (err: any) {
       const resultCodes = err?.response?.data?.extras?.result_codes;
@@ -866,6 +905,15 @@ function getBudgetMutex(recipientId: string): AsyncMutex {
   return m;
 }
 
+// Per-keypair mutex to serialize Stellar submissions (Issue #XXX).
+// Prevents concurrent payBill calls from loading the same sequence number.
+const _submissionMutexes = new Map<string, AsyncMutex>();
+function getSubmissionMutex(keypairId: string): AsyncMutex {
+  let m = _submissionMutexes.get(keypairId);
+  if (!m) { m = new AsyncMutex(); _submissionMutexes.set(keypairId, m); }
+  return m;
+}
+
 const MAX_PAYMENT = 1000;
 // Platform-level single-transaction cap (issue #83). Sits above the caregiver policy's
 // approvalThreshold so a compromised session cannot bypass it. Only changeable by redeploying.
@@ -917,6 +965,64 @@ function recordServiceFee(
   );
   // Append the single transaction — O(1) — instead of rewriting the whole file
   appendTransaction(tx);
+}
+
+/**
+ * Atomically apply a spending delta under the per-recipient budget mutex (Issue #17).
+ *
+ * The check-and-reserve is performed inside the same mutex lock that
+ * payForMedication / payBill acquire, so concurrent calls cannot both pass the
+ * budget gate when only one slot remains.
+ *
+ * @returns `{ ok: true }` if the delta was applied, or `{ ok: false, reason }` if
+ *          the budget would be exceeded after applying `delta`.
+ */
+export async function updateSpending(
+  category: 'medications' | 'bills' | 'serviceFees',
+  delta: number,
+  recipientId?: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  const rid = recipientId ?? currentRecipientId;
+  const release = await getBudgetMutex(rid).acquire();
+  try {
+    // Reload from disk so this call always sees updates made by other paths
+    const tracker = loadSpending(rid);
+    const policy = loadPolicy(rid);
+
+    const current = tracker[category];
+    const limit =
+      category === 'medications'
+        ? policy.medicationMonthlyBudget
+        : category === 'bills'
+          ? policy.billMonthlyBudget
+          : Infinity;
+    const totalSpent =
+      tracker.medications + tracker.bills + tracker.serviceFees;
+    const globalRemaining = roundBudget(policy.monthlyLimit - totalSpent);
+
+    if (roundBudget(current + delta) > limit) {
+      policyBlocksTotal.inc();
+      return {
+        ok: false,
+        reason: `$${delta.toFixed(2)} would exceed ${category} monthly budget ($${limit}; spent $${current.toFixed(2)})`,
+      };
+    }
+    if (delta > globalRemaining) {
+      policyBlocksTotal.inc();
+      return {
+        ok: false,
+        reason: `$${delta.toFixed(2)} would exceed overall monthly limit ($${policy.monthlyLimit}; remaining $${globalRemaining.toFixed(2)})`,
+      };
+    }
+
+    tracker[category] = roundBudget(current + delta);
+    saveSpending(tracker);
+    // Keep module-level var in sync for same-process reads
+    spendingTracker = tracker;
+    return { ok: true };
+  } finally {
+    release();
+  }
 }
 
 function loadPolicy(recipientId?: string): SpendingPolicy {
@@ -1088,7 +1194,12 @@ export async function comparePharmacyPrices(
     );
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  }
 
   // Extract real Stellar tx hash from x402 payment response header
   const txHashResult = extractX402TxHash(response);
@@ -1149,7 +1260,11 @@ export async function fetchRosaBill(recipientId?: string) {
     );
   }
 
-  return await response.json();
+  try {
+    return await response.json();
+  } catch (err) {
+    return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  }
 }
 
 // --- Tool: Fetch care recipient's bill AND audit it in one step (pays via x402) ---
@@ -1292,7 +1407,12 @@ export async function auditBill(
     );
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  }
 
   const txHashResult = extractX402TxHash(response);
   const txHash = txHashResult === TX_HASH_EXTRACTION_FAILED ? undefined : txHashResult;
@@ -1378,7 +1498,12 @@ export async function checkDrugInteractions(medications: string[]) {
     );
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  }
 
   const txHashResult = extractX402TxHash(response);
   const txHash = txHashResult === TX_HASH_EXTRACTION_FAILED ? undefined : txHashResult;
@@ -1547,7 +1672,12 @@ async function executeMedicationPayment(
       },
     );
 
-    const data = await response.json();
+    let data;
+    try {
+      data = await response.json();
+    } catch (err) {
+      return { ok: false, reason: 'MALFORMED_RESPONSE' };
+    }
     if (!data.success) {
       throw new Error(data.error || 'MPP payment failed');
     }
@@ -2023,7 +2153,7 @@ export async function payBill(
     releaseBill();
   }
 
-  // Execute real Stellar USDC transfer (outside the mutex — can be slow)
+  // Execute real Stellar USDC transfer (serialised per-keypair to avoid sequence races — Issue #XXX)
   const recipientKey = process.env.BILL_PROVIDER_PUBLIC_KEY;
   if (!recipientKey) {
     spendingTracker.bills -= amount; // roll back reservation
@@ -2037,6 +2167,7 @@ export async function payBill(
 
   let stellarTxHash: string | undefined;
 
+  const releaseSubmission = await getSubmissionMutex(agentKeypair.publicKey()).acquire();
   try {
     const account = await horizonServer.loadAccount(agentKeypair.publicKey());
     const usdcAsset = new Asset("USDC", USDC_ISSUER);
@@ -2065,6 +2196,8 @@ export async function payBill(
       success: false,
       error: `Stellar USDC transfer failed: ${JSON.stringify(errorDetail)}`,
     };
+  } finally {
+    releaseSubmission();
   }
 
   stellarTxSubmittedTotal.inc({ result: 'success' });
