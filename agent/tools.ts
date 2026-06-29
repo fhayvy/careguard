@@ -852,6 +852,64 @@ function recordServiceFee(
   appendTransaction(tx);
 }
 
+/**
+ * Atomically apply a spending delta under the per-recipient budget mutex (Issue #17).
+ *
+ * The check-and-reserve is performed inside the same mutex lock that
+ * payForMedication / payBill acquire, so concurrent calls cannot both pass the
+ * budget gate when only one slot remains.
+ *
+ * @returns `{ ok: true }` if the delta was applied, or `{ ok: false, reason }` if
+ *          the budget would be exceeded after applying `delta`.
+ */
+export async function updateSpending(
+  category: 'medications' | 'bills' | 'serviceFees',
+  delta: number,
+  recipientId?: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  const rid = recipientId ?? currentRecipientId;
+  const release = await getBudgetMutex(rid).acquire();
+  try {
+    // Reload from disk so this call always sees updates made by other paths
+    const tracker = loadSpending(rid);
+    const policy = loadPolicy(rid);
+
+    const current = tracker[category];
+    const limit =
+      category === 'medications'
+        ? policy.medicationMonthlyBudget
+        : category === 'bills'
+          ? policy.billMonthlyBudget
+          : Infinity;
+    const totalSpent =
+      tracker.medications + tracker.bills + tracker.serviceFees;
+    const globalRemaining = roundBudget(policy.monthlyLimit - totalSpent);
+
+    if (roundBudget(current + delta) > limit) {
+      policyBlocksTotal.inc();
+      return {
+        ok: false,
+        reason: `$${delta.toFixed(2)} would exceed ${category} monthly budget ($${limit}; spent $${current.toFixed(2)})`,
+      };
+    }
+    if (delta > globalRemaining) {
+      policyBlocksTotal.inc();
+      return {
+        ok: false,
+        reason: `$${delta.toFixed(2)} would exceed overall monthly limit ($${policy.monthlyLimit}; remaining $${globalRemaining.toFixed(2)})`,
+      };
+    }
+
+    tracker[category] = roundBudget(current + delta);
+    saveSpending(tracker);
+    // Keep module-level var in sync for same-process reads
+    spendingTracker = tracker;
+    return { ok: true };
+  } finally {
+    release();
+  }
+}
+
 function loadPolicy(recipientId?: string): SpendingPolicy {
   const file = getPolicyFile(recipientId);
   if (!existsSync(file)) return { ...DEFAULT_POLICY };
