@@ -1146,7 +1146,12 @@ export async function comparePharmacyPrices(
     );
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  }
 
   // Extract real Stellar tx hash from x402 payment response header
   const txHashResult = extractX402TxHash(response);
@@ -1207,7 +1212,11 @@ export async function fetchRosaBill(recipientId?: string) {
     );
   }
 
-  return await response.json();
+  try {
+    return await response.json();
+  } catch (err) {
+    return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  }
 }
 
 // --- Tool: Fetch care recipient's bill AND audit it in one step (pays via x402) ---
@@ -1350,7 +1359,12 @@ export async function auditBill(
     );
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  }
 
   const txHashResult = extractX402TxHash(response);
   const txHash = txHashResult === TX_HASH_EXTRACTION_FAILED ? undefined : txHashResult;
@@ -1436,7 +1450,12 @@ export async function checkDrugInteractions(medications: string[]) {
     );
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  }
 
   const txHashResult = extractX402TxHash(response);
   const txHash = txHashResult === TX_HASH_EXTRACTION_FAILED ? undefined : txHashResult;
@@ -1605,7 +1624,12 @@ async function executeMedicationPayment(
       },
     );
 
-    const data = await response.json();
+    let data;
+    try {
+      data = await response.json();
+    } catch (err) {
+      return { ok: false, reason: 'MALFORMED_RESPONSE' };
+    }
     if (!data.success) {
       throw new Error(data.error || 'MPP payment failed');
     }
